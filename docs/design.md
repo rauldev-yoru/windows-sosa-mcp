@@ -44,7 +44,7 @@ MCP client ──stdio JSON-RPC──▶ windows-sosa-mcp.exe
 | Group | Tools | Implementation |
 |---|---|---|
 | core | `windows_health`, `windows_run_powershell` | Win32 queries; `powershell.exe` 5.1 child with a job object |
-| files | `windows_list_directory`, `windows_find_files`, `windows_stat_path`, `windows_read_text_file`, `windows_resolve_executable`, `windows_search_text`, `windows_write_text_file`, `windows_edit_text_file` | Rust std + Win32; `windows_search_text` runs a pinned `rg.exe` |
+| files | `windows_list_directory`, `windows_find_files`, `windows_stat_path`, `windows_read_text_file`, `windows_resolve_executable`, `windows_search_text`, `windows_write_text_file`, `windows_edit_text_file` | Rust std + Win32; `windows_search_text` uses ripgrep's library crates in-process |
 | jobs | `windows_job_start`, `windows_job_status`, `windows_job_list`, `windows_job_cancel` | the exe re-launched as its own supervisor |
 | packages | `windows_package_query`, `windows_package_install` | `winget.exe` directly; installs run as a job |
 | UI | `windows_list_windows`, `windows_ui_snapshot`, `windows_ui_action` | native UI Automation on a resident COM MTA thread |
@@ -90,7 +90,6 @@ MCP client ──stdio JSON-RPC──▶ windows-sosa-mcp.exe
 | `…\handsfree\` | `state.json`, `stop.json` (D26) |
 | `…\ui_snapshots\`, `…\ui_captures\` | snapshot (120 s) and capture (600 s) records (D17) |
 | `%APPDATA%\windows-sosa-mcp\ui_policy.json` (`WINDOWS_SOSA_MCP_UI_POLICY`) | UI privacy policy (D18) |
-| `<exe dir>\vendor\rg.exe` + `rg.sha256` (`WINDOWS_SOSA_MCP_VENDOR`) | pinned ripgrep (D15) |
 
 Off Windows the state root falls back to `$XDG_STATE_HOME/windows-sosa-mcp`.
 
@@ -165,7 +164,8 @@ Common kinds:
 | `not_found`, `already_exists`, `access_denied`, `io_error` | filesystem/OS outcomes |
 | `unsupported_path`, `reparse_point_not_supported` | UNC, device or reparse-point targets where not allowed |
 | `version_conflict`, `file_changed`, `text_not_found`, `ambiguous_match` | compare-and-commit edits |
-| `dependency_missing`, `dependency_changed` | pinned `rg.exe` absent or hash mismatch |
+| `dependency_missing` | `winget.exe` not found |
+| `search_failed`, `file_too_large` | invalid pattern/glob/encoding or search errors; named file over 1 MiB |
 | `execution_failed`, `launch_failed` | PowerShell/job process outcome |
 | `window_ambiguous`, `window_gone`, `window_excluded`, `snapshot_not_found`, `ref_not_found`, `ref_stale`, `pattern_unavailable`, `element_offscreen`, `activation_denied` | UI Automation |
 | `handsfree_required`, `handsfree_stale`, `handsfree_ended`, `handsfree_session_mismatch`, `session_locked`, `target_elevated`, `foreground_mismatch`, `foreground_changed_abort`, `cursor_placement_blocked`, `capture_not_found` | hands-free and input |
@@ -178,7 +178,6 @@ Common kinds:
 |---|---|---|
 | `WINDOWS_SOSA_MCP_HOME` | `%LOCALAPPDATA%\windows-sosa-mcp` | state root |
 | `WINDOWS_SOSA_MCP_UI_POLICY` | `%APPDATA%\windows-sosa-mcp\ui_policy.json` | UI privacy policy file |
-| `WINDOWS_SOSA_MCP_VENDOR` | `<exe dir>\vendor` | directory of `rg.exe` + `rg.sha256` |
 | `WINDOWS_SOSA_MCP_POWERSHELL` | `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` | PowerShell used by shell and jobs |
 | `WINDOWS_SOSA_MCP_WINGET` | `winget.exe` on `PATH` | WinGet executable |
 | `WINDOWS_SOSA_MCP_FORCE_WMI` | unset | `1` forces the WMI job launch path (tests) |
@@ -214,8 +213,6 @@ Common kinds:
   mid-session has no overlay.
 - `type` input above ~60 characters per second is unreliable in WinUI/TSF
   apps; use `paste` or UIA `set_value` for exact text.
-- `windows_search_text` requires the pinned `rg.exe` next to the exe
-  (bundled in the release zip).
 - Typical client-observed latency: tens of milliseconds or less for
   health, file and window-listing calls; ~0.1–0.4 s for snapshots of a few
   hundred nodes and full-monitor captures; `windows_run_powershell` is
@@ -257,7 +254,7 @@ Common kinds:
 | D12 | Per-user state root |
 | D13 | Metadata-only audit log |
 | D14 | Cross-process busy lock |
-| D15 | `windows_search_text` uses a pinned ripgrep |
+| D15 | `windows_search_text` embeds ripgrep's library crates |
 | D16 | Packages: `winget.exe` directly, positional parsing |
 | D17 | UI module layout and stable render format |
 | D18 | UI privacy policy file |
@@ -387,14 +384,20 @@ scripts), status, error kind, duration, pid, user, `caller`
 server process gets `busy` immediately (audited as `rejected`). Clients
 should not issue parallel tool calls to this server.
 
-**D15 — `windows_search_text` uses a pinned ripgrep.** `rg.exe` 15.2.0,
-verified against `vendor\rg.sha256` on every search, gives proven
-encoding, binary-file and `.gitignore` handling without re-implementing
-them. It lives in `vendor\` next to the exe (override
-`WINDOWS_SOSA_MCP_VENDOR`); `scripts\fetch-rg.ps1 -Dest <dir>` downloads
-the pinned release and checks archive and exe hashes; the release zip
-bundles it. Missing binary → `dependency_missing`, changed binary →
-`dependency_changed`; there is no fallback engine.
+**D15 — `windows_search_text` embeds ripgrep's library crates.** The
+search runs in-process with `ignore` (walk, `.gitignore`/`.ignore`/
+`.rgignore`, hidden files, globs, depth, 1 MiB file cap), `grep-regex`
+(Rust regex; literal mode = fixed strings) and `grep-searcher` (line
+numbers, context, BOM sniffing / explicit encodings, binary detection:
+walked files stop at the first NUL, an explicitly named file is searched
+with NULs converted). The options mirror the ripgrep command line used up
+to 0.1.0 (`--threads 1 --no-mmap --max-filesize 1M --no-ignore-parent
+--no-ignore-global`), so results are the same, the server stays a single
+exe and the search stops as soon as a result/output/time budget is hit
+instead of draining a subprocess. `native_exit_code` keeps ripgrep's
+meaning (0 match, 1 none, 2 errors; errors with no stop reason →
+`search_failed`); `engine_version` names the `grep-searcher` version.
+(0.1.0 shipped a pinned `rg.exe` in a release zip instead.)
 
 **D16 — Packages: `winget.exe` directly, positional parsing.**
 `windows_package_query` runs `winget list`/`show --versions` with an exact

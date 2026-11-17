@@ -149,41 +149,12 @@ fn p(dir: &Path, name: &str) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
 
-/// Vendor dir with the host's ripgrep and its receipt (Linux: `rg` on PATH;
-/// Windows: the pinned `vendor\rg.exe` next to the test binary if present).
-fn vendor(dir: &Path) -> Option<std::path::PathBuf> {
-    let exe = if cfg!(windows) { "rg.exe" } else { "rg" };
-    let src = std::env::var_os("SOSA_TEST_RG")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::split_paths(&std::env::var_os("PATH")?)
-                .map(|d| d.join(exe))
-                .find(|p| p.is_file())
-        })?;
-    let v = dir.join("vendor");
-    std::fs::create_dir_all(&v).ok()?;
-    std::fs::copy(&src, v.join(exe)).ok()?;
-    let bytes = std::fs::read(v.join(exe)).ok()?;
-    use sha2::Digest;
-    let hex: String = sha2::Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    std::fs::write(v.join("rg.sha256"), hex).ok()?;
-    Some(v)
-}
-
 #[test]
 fn files_write_read_edit_stat_list_find_search() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let w = work.path();
-    let v = vendor(home.path());
-    let mut env: Vec<(&str, &Path)> = vec![("WINDOWS_SOSA_MCP_HOME", home.path())];
-    if let Some(v) = v.as_deref() {
-        env.push(("WINDOWS_SOSA_MCP_VENDOR", v));
-    }
-    let mut mcp = Mcp::spawn_env(&env);
+    let mut mcp = Mcp::spawn_env(&[("WINDOWS_SOSA_MCP_HOME", home.path())]);
     let f = p(w, "nota.txt");
     let r = mcp.call(
         "windows_write_text_file",
@@ -225,16 +196,12 @@ fn files_write_read_edit_stat_list_find_search() {
         "windows_search_text",
         json!({"path": w.to_string_lossy(), "pattern": "world"}),
     );
-    if v.is_some() {
-        assert_eq!(sr["status"], "succeeded", "{sr}");
-        assert_eq!(
-            sr["data"]["matches"].as_array().map(Vec::len),
-            Some(1),
-            "{sr}"
-        );
-    } else {
-        assert_eq!(sr["error_kind"], "dependency_missing");
-    }
+    assert_eq!(sr["status"], "succeeded", "{sr}");
+    assert_eq!(
+        sr["data"]["matches"].as_array().map(Vec::len),
+        Some(1),
+        "{sr}"
+    );
     let missing = mcp.call("windows_stat_path", json!({"path": p(w, "nope")}));
     assert_eq!(missing["status"], "succeeded", "{missing}");
     if cfg!(windows) {

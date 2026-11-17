@@ -653,7 +653,7 @@
     },
     {
       "name": "windows_search_text",
-      "description": "Search file contents via pinned Windows ripgrep. Literal by default; explicit regex/ignore/hidden/glob/depth settings. Returns matches and context with absolute paths and line numbers. Inspect scan_complete, stop_reason, scope and warnings. Search text is discovery evidence, not a byte-faithful read for edits.",
+      "description": "Search file contents with the built-in ripgrep engine. Literal by default; explicit regex/ignore/hidden/glob/depth settings. Returns matches and context with absolute paths and line numbers. Inspect scan_complete, stop_reason, scope and warnings. Search text is discovery evidence, not a byte-faithful read for edits.",
       "inputSchema": {
         "type": "object",
         "properties": {

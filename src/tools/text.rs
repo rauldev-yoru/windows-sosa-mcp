@@ -1,9 +1,9 @@
 //! Text tools: strict decoding/encoding, `windows_read_text_file` paging,
 //! `windows_write_text_file`, `windows_edit_text_file` and
-//! `windows_search_text` (pinned ripgrep), with snapshot/compare-and-commit
+//! `windows_search_text` (in-process ripgrep engine), with snapshot/compare-and-commit
 //! writes.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -970,282 +970,306 @@ pub fn prepare_search(a: &Value) -> Result<SearchArgs, ToolError> {
     })
 }
 
-pub fn search_argv(a: &SearchArgs) -> Vec<String> {
-    let mut out: Vec<String> = [
-        "--json",
-        "--no-config",
-        "--color",
-        "never",
-        "--line-buffered",
-        "--no-mmap",
-        "--threads",
-        "1",
-        "--max-filesize",
-        "1M",
-        "--max-depth",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    out.push((a.max_depth + 1).to_string());
-    out.extend([
-        "--encoding".into(),
-        a.encoding.clone(),
-        "--context".into(),
-        a.context_lines.to_string(),
-    ]);
-    out.push(
-        if a.case_sensitive {
-            "--case-sensitive"
-        } else {
-            "--ignore-case"
+/// Search engine: ripgrep's library crates, linked into the server.
+/// Kept in sync with Cargo.lock by the `engine_version_matches_lock` test.
+pub const ENGINE_VERSION: &str = "grep-searcher 0.1.17";
+
+const TIME_BUDGET: Duration = Duration::from_millis(10_000);
+/// Budget for the raw records produced (characters), like the former
+/// subprocess output cap.
+const RAW_BUDGET: usize = 2_097_152;
+const MAX_RETAINED: usize = 262_144;
+const MAX_LINE_CHARS: usize = 4096;
+
+/// Accumulates search records with the result, output and time budgets.
+struct Collector<'a> {
+    a: &'a SearchArgs,
+    start: Instant,
+    matches: Vec<Value>,
+    count: usize,
+    retained: usize,
+    raw: usize,
+    errors: Vec<String>,
+    notes: Vec<String>,
+    binary: bool,
+    errored: bool,
+    matched: bool,
+    stop: Option<&'static str>,
+}
+
+impl<'a> Collector<'a> {
+    fn new(a: &'a SearchArgs) -> Self {
+        Self {
+            a,
+            start: Instant::now(),
+            matches: Vec::new(),
+            count: 0,
+            retained: 0,
+            raw: 0,
+            errors: Vec::new(),
+            notes: Vec::new(),
+            binary: false,
+            errored: false,
+            matched: false,
+            stop: None,
         }
-        .into(),
-    );
-    if a.mode == "literal" {
-        out.push("--fixed-strings".into());
     }
-    if a.include_hidden {
-        out.push("--hidden".into());
+
+    /// False once any budget is exhausted (and records why).
+    fn budget(&mut self) -> bool {
+        if self.stop.is_some() {
+            return false;
+        }
+        if self.start.elapsed() > TIME_BUDGET {
+            self.stop = Some("time_budget");
+        } else if self.raw > RAW_BUDGET {
+            self.stop = Some("output_limit");
+        }
+        self.stop.is_none()
     }
-    out.extend(["--no-ignore-parent".into(), "--no-ignore-global".into()]);
-    if !a.respect_ignore {
-        out.push("--no-ignore".into());
+
+    fn error(&mut self, msg: String) {
+        self.errored = true;
+        self.raw += msg.len();
+        self.errors.push(msg);
     }
-    for g in &a.include {
-        out.extend(["--glob".into(), g.clone()]);
+
+    /// One `match`/`context` record; false = stop searching.
+    fn record(&mut self, kind: &'static str, path: &Path, line: Option<u64>, bytes: &[u8]) -> bool {
+        if !self.budget() {
+            return false;
+        }
+        self.raw += bytes.len() + path.as_os_str().len() + 96;
+        if kind == "match" {
+            self.matched = true;
+        }
+        let (Some(p), Ok(t)) = (path.to_str(), std::str::from_utf8(bytes)) else {
+            self.notes.push("Non-UTF8 search record skipped".into());
+            return true;
+        };
+        let limit = self.a.limit;
+        if kind == "match" {
+            if self.count >= limit {
+                self.stop = Some("result_limit");
+                return false;
+            }
+            self.count += 1;
+        }
+        if self.matches.len() >= limit * (1 + 2 * self.a.context_lines) {
+            self.stop = Some("result_limit");
+            return false;
+        }
+        let text = t.trim_end_matches(['\r', '\n']);
+        let n = text.chars().count();
+        self.retained += n.min(MAX_LINE_CHARS);
+        if self.retained > MAX_RETAINED {
+            self.stop = Some("output_limit");
+            return false;
+        }
+        self.matches.push(json!({
+            "path": p, "line_number": line.unwrap_or(1),
+            "text": text.chars().take(MAX_LINE_CHARS).collect::<String>(), "kind": kind,
+            "text_truncated": n > MAX_LINE_CHARS,
+        }));
+        true
     }
-    for g in &a.exclude {
-        out.extend(["--glob".into(), format!("!{g}")]);
-    }
-    out.extend([
-        "--regexp".into(),
-        a.pattern.clone(),
-        "--".into(),
-        a.path.clone(),
-    ]);
-    out
 }
 
-/// Pinned ripgrep next to the server binary: `vendor\rg.exe` verified
-/// against the receipt `vendor\rg.sha256`.
-pub fn rg_path() -> Result<PathBuf, TextError> {
-    let dir = match std::env::var_os("WINDOWS_SOSA_MCP_VENDOR") {
-        Some(d) => PathBuf::from(d),
-        None => std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("vendor")))
-            .unwrap_or_default(),
-    };
-    let exe = dir.join(if cfg!(windows) { "rg.exe" } else { "rg" });
-    let receipt = dir.join("rg.sha256");
-    if !exe.is_file() || !receipt.is_file() {
-        return Err(TextError::msg(
-            "dependency_missing",
-            "Place the pinned rg.exe and rg.sha256 in the vendor directory next to windows-sosa-mcp.exe; no alternate search engine is used",
-        ));
-    }
-    let want = std::fs::read_to_string(&receipt).map_err(|e| TextError::io(&e))?;
-    let have = digest(&std::fs::read(&exe).map_err(|e| TextError::io(&e))?);
-    if have != want.trim() {
-        return Err(TextError::new("dependency_changed"));
-    }
-    Ok(exe)
+/// grep-searcher sink for one file.
+struct FileSink<'c, 'a> {
+    col: &'c mut Collector<'a>,
+    path: &'c Path,
+    output: bool,
+    binary: bool,
 }
 
-pub struct RawSearch {
-    pub lines: Vec<String>,
-    pub errors: Vec<String>,
-    pub native_exit_code: i64,
-    pub stop_reason: String,
+impl grep_searcher::Sink for FileSink<'_, '_> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _: &grep_searcher::Searcher,
+        m: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        self.output = true;
+        Ok(self
+            .col
+            .record("match", self.path, m.line_number(), m.bytes()))
+    }
+
+    fn context(
+        &mut self,
+        _: &grep_searcher::Searcher,
+        c: &grep_searcher::SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        self.output = true;
+        Ok(self
+            .col
+            .record("context", self.path, c.line_number(), c.bytes()))
+    }
+
+    fn binary_data(&mut self, _: &grep_searcher::Searcher, _: u64) -> Result<bool, Self::Error> {
+        self.binary = true;
+        Ok(true)
+    }
 }
 
-/// The worker `search` op: run rg with a 10 s / 2 MiB-chars budget.
-pub fn run_search(exe: &Path, argv: &[String], root: &str) -> Result<RawSearch, TextError> {
-    if let Ok(m) = std::fs::metadata(root)
+fn walker(a: &SearchArgs) -> Result<ignore::Walk, TextError> {
+    let mut over = ignore::overrides::OverrideBuilder::new(&a.path);
+    let globs = a
+        .include
+        .iter()
+        .cloned()
+        .chain(a.exclude.iter().map(|g| format!("!{g}")));
+    for g in globs {
+        over.add(&g)
+            .map_err(|e| TextError::msg("search_failed", e.to_string()))?;
+    }
+    let over = over
+        .build()
+        .map_err(|e| TextError::msg("search_failed", e.to_string()))?;
+    let mut w = ignore::WalkBuilder::new(&a.path);
+    w.hidden(!a.include_hidden)
+        .parents(false)
+        .git_global(false)
+        .follow_links(false)
+        .max_depth(Some(a.max_depth.max(0) as usize + 1))
+        .max_filesize(Some(LIMIT as u64))
+        .overrides(over);
+    if a.respect_ignore {
+        w.add_custom_ignore_filename(".rgignore");
+    } else {
+        w.ignore(false).git_ignore(false).git_exclude(false);
+    }
+    Ok(w.build())
+}
+
+fn searcher(a: &SearchArgs) -> Result<grep_searcher::Searcher, TextError> {
+    let mut b = grep_searcher::SearcherBuilder::new();
+    b.line_number(true)
+        .before_context(a.context_lines)
+        .after_context(a.context_lines)
+        .memory_map(grep_searcher::MmapChoice::never())
+        .bom_sniffing(true);
+    if a.encoding != "auto" {
+        let enc = grep_searcher::Encoding::new(&a.encoding)
+            .map_err(|e| TextError::msg("search_failed", e.to_string()))?;
+        b.encoding(Some(enc));
+    }
+    Ok(b.build())
+}
+
+fn matcher(a: &SearchArgs) -> Result<grep_regex::RegexMatcher, TextError> {
+    grep_regex::RegexMatcherBuilder::new()
+        .multi_line(true)
+        .unicode(true)
+        .octal(false)
+        .case_insensitive(!a.case_sensitive)
+        .fixed_strings(a.mode == "literal")
+        .line_terminator(Some(b'\n'))
+        .build(&a.pattern)
+        .map_err(|e| TextError::msg("search_failed", e.to_string()))
+}
+
+/// Run the search in-process: single-threaded walk honouring ignore files,
+/// globs, depth and the 1 MiB file cap; binary files are skipped (an
+/// explicitly named file is searched with NULs converted, like ripgrep).
+pub fn run_search(a: &SearchArgs) -> Result<Value, TextError> {
+    if let Ok(m) = std::fs::metadata(&a.path)
         && m.is_file()
         && m.len() > LIMIT as u64
     {
         return Err(TextError::new("file_too_large"));
     }
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .unwrap_or_else(|| ".".into());
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(argv)
-        .current_dir(home)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    crate::platform::no_window(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| TextError::msg("launch_failed", e.to_string()))?;
-    let (tx, rx) = std::sync::mpsc::channel::<(bool, Option<String>)>();
-    let out = child.stdout.take().unwrap();
-    let err = child.stderr.take().unwrap();
-    for (is_err, pipe) in [
-        (false, Box::new(out) as Box<dyn Read + Send>),
-        (true, Box::new(err)),
-    ] {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut rd = std::io::BufReader::new(pipe);
-            let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match rd.read_until(b'\n', &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let s = String::from_utf8_lossy(&buf);
-                        let line = s.strip_suffix('\n').unwrap_or(&s);
-                        let line = line.strip_suffix('\r').unwrap_or(line).to_string();
-                        if tx.send((is_err, Some(line))).is_err() {
-                            break;
-                        }
-                    }
-                }
+    let matcher = matcher(a)?;
+    let mut searcher = searcher(a)?;
+    let mut col = Collector::new(a);
+    for entry in walker(a)? {
+        if !col.budget() {
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                col.error(e.to_string());
+                continue;
             }
-            let _ = tx.send((is_err, None));
+        };
+        if let Some(e) = entry.error() {
+            col.notes.push(e.to_string());
+        }
+        let explicit = entry.depth() == 0;
+        let is_file =
+            entry.file_type().is_some_and(|t| t.is_file()) || (explicit && entry.path().is_file());
+        if !is_file {
+            continue;
+        }
+        searcher.set_binary_detection(if explicit {
+            grep_searcher::BinaryDetection::convert(b'\x00')
+        } else {
+            grep_searcher::BinaryDetection::quit(b'\x00')
         });
-    }
-    drop(tx);
-    let watch = Instant::now();
-    let (mut lines, mut errors, mut chars, mut open) = (Vec::new(), Vec::new(), 0usize, 2);
-    let mut reason = "exhausted";
-    while open > 0 {
-        if watch.elapsed() > Duration::from_millis(10_000) {
-            reason = "time_budget";
-            break;
+        let path = entry.path();
+        let mut sink = FileSink {
+            col: &mut col,
+            path,
+            output: false,
+            binary: false,
+        };
+        let res = searcher.search_path(&matcher, path, &mut sink);
+        let (output, binary) = (sink.output, sink.binary);
+        if output && binary {
+            col.binary = true;
         }
-        if chars > 2_097_152 {
-            reason = "output_limit";
-            break;
-        }
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok((_, None)) => open -= 1,
-            Ok((is_err, Some(l))) => {
-                chars += l.encode_utf16().count();
-                if is_err {
-                    errors.push(l)
-                } else {
-                    lines.push(l)
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(_) => break,
+        if let Err(e) = res {
+            col.error(format!("{}: {e}", path.display()));
         }
     }
-    if reason != "exhausted" {
-        let _ = child.kill();
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let code = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st.code().unwrap_or(-1) as i64,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                return Err(TextError::new("search_termination_unconfirmed"));
-            }
-        }
-    };
-    Ok(RawSearch {
-        lines,
-        errors,
-        native_exit_code: code,
-        stop_reason: reason.into(),
-    })
+    finish_search(col)
 }
 
-pub fn parse_search(raw: &RawSearch, a: &SearchArgs) -> Result<Value, TextError> {
-    let mut matches: Vec<Value> = Vec::new();
-    let mut count = 0usize;
-    let mut warnings: Vec<String> = raw.errors.iter().take(20).cloned().collect();
-    let mut reason = raw.stop_reason.clone();
-    let (mut binary, mut retained) = (false, 0usize);
-    for line in &raw.lines {
-        let event: Value =
-            serde_json::from_str(line).map_err(|_| TextError::new("invalid_search_output"))?;
-        let d = event.get("data").cloned().unwrap_or(json!({}));
-        let ty = event.get("type").and_then(Value::as_str).unwrap_or("");
-        if ty == "end" && d.get("binary_offset").is_some_and(|v| !v.is_null()) {
-            binary = true;
-        }
-        if ty != "match" && ty != "context" {
-            continue;
-        }
-        let (Some(p), Some(t)) = (
-            d.pointer("/path/text").and_then(Value::as_str),
-            d.pointer("/lines/text").and_then(Value::as_str),
-        ) else {
-            warnings.push("Non-UTF8 search record skipped".into());
-            continue;
-        };
-        if ty == "match" {
-            if count >= a.limit {
-                reason = "result_limit".into();
-                break;
-            }
-            count += 1;
-        }
-        if matches.len() >= a.limit * (1 + 2 * a.context_lines) {
-            reason = "result_limit".into();
-            break;
-        }
-        let text = t.trim_end_matches(['\r', '\n']);
-        let n = text.chars().count();
-        retained += n.min(4096);
-        if retained > 262_144 {
-            reason = "output_limit".into();
-            break;
-        }
-        matches.push(json!({
-            "path": p, "line_number": d.get("line_number").cloned().unwrap_or(json!(1)),
-            "text": text.chars().take(4096).collect::<String>(), "kind": ty, "text_truncated": n > 4096,
-        }));
-    }
-    if binary {
+fn finish_search(col: Collector<'_>) -> Result<Value, TextError> {
+    let a = col.a;
+    let mut warnings: Vec<String> = col.errors.iter().take(20).cloned().collect();
+    warnings.extend(col.notes.iter().cloned());
+    // ripgrep-compatible exit code: 0 = matched, 1 = no match, 2 = errors.
+    let native_exit_code = if col.errored {
+        2
+    } else if col.matched {
+        0
+    } else {
+        1
+    };
+    let mut reason = col.stop.unwrap_or("exhausted").to_string();
+    if col.binary {
         warnings.push(
             "Binary detection stopped at least one file; matches may precede detection".into(),
         );
     }
-    if !matches!(raw.native_exit_code, 0 | 1) && reason == "exhausted" {
+    if native_exit_code == 2 && reason == "exhausted" {
         let joined: String = warnings.join("\n").chars().take(4000).collect();
-        return Err(TextError::msg(
-            "search_failed",
-            if joined.is_empty() {
-                "ripgrep returned an error".into()
-            } else {
-                joined
-            },
-        ));
+        return Err(TextError::msg("search_failed", joined));
     }
     if !warnings.is_empty() && reason == "exhausted" {
         reason = "search_warnings".into();
     }
-    let count = matches.iter().filter(|m| m["kind"] == "match").count();
     warnings.truncate(20);
     Ok(json!({
-        "path": a.path, "matches": matches, "count": count, "scan_complete": reason == "exhausted",
+        "path": a.path, "matches": col.matches, "count": col.count, "scan_complete": reason == "exhausted",
         "stop_reason": reason,
         "scope": {
             "mode": a.mode, "encoding": a.encoding, "max_depth": a.max_depth, "include_hidden": a.include_hidden,
             "respect_ignore": a.respect_ignore, "include": a.include, "exclude": a.exclude,
             "max_file_bytes": LIMIT, "follow_links": false, "ignore_parent": false, "ignore_global": false,
         },
-        "warnings": warnings, "native_exit_code": raw.native_exit_code, "engine_version": RG_VERSION,
+        "warnings": warnings, "native_exit_code": native_exit_code, "engine_version": ENGINE_VERSION,
     }))
 }
-
-/// Version of the pinned ripgrep (see scripts/fetch-rg.ps1).
-pub const RG_VERSION: &str = "15.2.0";
 
 pub fn search_text(args: SearchArgs) -> Envelope {
     let start = Instant::now();
     let mut r = envelope::base("windows_search_text");
-    let out = rg_path()
-        .and_then(|exe| run_search(&exe, &search_argv(&args), &args.path))
-        .and_then(|raw| parse_search(&raw, &args));
+    let out = run_search(&args);
     finish(&mut r, start, out);
     r
 }
@@ -1454,35 +1478,168 @@ mod tests {
         assert_eq!(r["may_have_changed"], false);
     }
 
+    fn sargs(root: &Path, pattern: &str, extra: Value) -> SearchArgs {
+        let mut v = json!({"path": root.to_str().unwrap(), "pattern": pattern});
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        prepare_search(&v).unwrap()
+    }
+
+    fn search_tree() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        std::fs::write(r.join("a.txt"), "one\nhit 1\r\nthree\nhit 2\n").unwrap();
+        std::fs::write(r.join("b.rs"), "fn hit() {}\n").unwrap();
+        std::fs::write(r.join(".hidden.txt"), "hit hidden\n").unwrap();
+        std::fs::write(r.join("bin.dat"), b"hit\x00\x01\x02").unwrap();
+        std::fs::write(r.join(".ignore"), "ignored.txt\n").unwrap();
+        std::fs::write(r.join("ignored.txt"), "hit ignored\n").unwrap();
+        std::fs::create_dir_all(r.join("d1").join("d2")).unwrap();
+        std::fs::write(r.join("d1").join("d2").join("deep.txt"), "hit deep\n").unwrap();
+        let mut u16 = vec![0xff, 0xfe];
+        u16.extend("hit ñ utf16\n".encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(r.join("w.txt"), u16).unwrap();
+        d
+    }
+
+    fn files(v: &Value) -> Vec<String> {
+        let mut f: Vec<String> = v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["kind"] == "match")
+            .map(|m| {
+                Path::new(m["path"].as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        f.sort();
+        f.dedup();
+        f
+    }
+
     #[test]
-    fn search_parsing() {
-        let a = prepare_search(&json!({"path": "C:\\x", "pattern": "p", "limit": 1})).unwrap();
-        assert!(search_argv(&a).ends_with(&[
-            "--regexp".into(),
-            "p".into(),
-            "--".into(),
-            "C:\\x".into()
-        ]));
-        let raw = RawSearch {
-            lines: vec![
-                r#"{"type":"begin","data":{"path":{"text":"C:\\x\\a"}}}"#.into(),
-                r#"{"type":"match","data":{"path":{"text":"C:\\x\\a"},"lines":{"text":"hit 1\r\n"},"line_number":3}}"#.into(),
-                r#"{"type":"match","data":{"path":{"text":"C:\\x\\a"},"lines":{"text":"hit 2\n"},"line_number":4}}"#.into(),
-            ],
-            errors: vec![],
-            native_exit_code: 0,
-            stop_reason: "exhausted".into(),
-        };
-        let v = parse_search(&raw, &a).unwrap();
+    fn search_defaults_skip_hidden_ignored_and_binary() {
+        let d = search_tree();
+        let v = run_search(&sargs(d.path(), "hit", json!({}))).unwrap();
+        assert_eq!(files(&v), ["a.txt", "b.rs", "deep.txt", "w.txt"], "{v}");
+        assert_eq!(v["count"], 5);
+        assert_eq!(v["stop_reason"], "exhausted");
+        assert_eq!(v["scan_complete"], true);
+        assert_eq!(v["native_exit_code"], 0);
+        assert_eq!(v["engine_version"], ENGINE_VERSION);
+        let m = v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["text"] == "hit 1")
+            .unwrap();
+        assert_eq!(m["line_number"], 2);
+        assert!(v.to_string().contains("hit ñ utf16"), "{v}");
+    }
+
+    #[test]
+    fn search_options() {
+        let d = search_tree();
+        let r = d.path();
+        let v = run_search(&sargs(
+            r,
+            "hit",
+            json!({"include_hidden": true, "respect_ignore": false}),
+        ))
+        .unwrap();
+        assert_eq!(
+            files(&v),
+            [
+                ".hidden.txt",
+                "a.txt",
+                "b.rs",
+                "deep.txt",
+                "ignored.txt",
+                "w.txt"
+            ]
+        );
+        let v = run_search(&sargs(r, "hit", json!({"max_depth": 1}))).unwrap();
+        assert!(!files(&v).contains(&"deep.txt".to_string()), "{v}");
+        let v = run_search(&sargs(r, "hit", json!({"include": ["*.rs"]}))).unwrap();
+        assert_eq!(files(&v), ["b.rs"]);
+        let v = run_search(&sargs(r, "hit", json!({"exclude": ["*.txt"]}))).unwrap();
+        assert_eq!(files(&v), ["b.rs"]);
+        let v = run_search(&sargs(r, "HIT", json!({}))).unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["native_exit_code"], 1);
+        let v = run_search(&sargs(r, "HIT", json!({"case_sensitive": false}))).unwrap();
+        assert_eq!(v["count"], 5);
+        let v = run_search(&sargs(r, "hit (1|2)", json!({}))).unwrap();
+        assert_eq!(v["count"], 0, "literal mode treats the pattern verbatim");
+        let v = run_search(&sargs(r, "^hit [12]$", json!({"mode": "regex"}))).unwrap();
+        // like ripgrep without --crlf, `$` does not match before `\r`
+        assert_eq!(v["count"], 1, "{v}");
+        let v = run_search(&sargs(
+            &r.join("a.txt"),
+            "three",
+            json!({"context_lines": 1}),
+        ))
+        .unwrap();
+        let kinds: Vec<_> = v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["kind"].as_str().unwrap(),
+                    m["line_number"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(kinds, [("context", 2), ("match", 3), ("context", 4)]);
+        let v = run_search(&sargs(
+            &r.join("w.txt"),
+            "ñ",
+            json!({"encoding": "utf-16le"}),
+        ))
+        .unwrap();
+        assert_eq!(v["count"], 1, "{v}");
+    }
+
+    #[test]
+    fn search_limits_and_errors() {
+        let d = search_tree();
+        let r = d.path();
+        let v = run_search(&sargs(r, "hit", json!({"limit": 1}))).unwrap();
         assert_eq!(v["count"], 1);
-        assert_eq!(v["matches"][0]["text"], "hit 1");
         assert_eq!(v["stop_reason"], "result_limit");
-        let bad = RawSearch {
-            lines: vec![],
-            errors: vec!["boom".into()],
-            native_exit_code: 2,
-            stop_reason: "exhausted".into(),
-        };
-        assert_eq!(parse_search(&bad, &a).unwrap_err().kind, "search_failed");
+        assert_eq!(v["scan_complete"], false);
+        // an explicitly named binary file is searched (NULs converted)
+        let v = run_search(&sargs(&r.join("bin.dat"), "hit", json!({}))).unwrap();
+        assert_eq!(v["count"], 1, "{v}");
+        assert!(
+            v["warnings"][0].as_str().unwrap().starts_with("Binary"),
+            "{v}"
+        );
+        let e = run_search(&sargs(r, "(", json!({"mode": "regex"}))).unwrap_err();
+        assert_eq!(e.kind, "search_failed");
+        let e = run_search(&sargs(&r.join("missing"), "x", json!({}))).unwrap_err();
+        assert_eq!(e.kind, "search_failed");
+        std::fs::write(r.join("big.txt"), vec![b'a'; LIMIT + 1]).unwrap();
+        let e = run_search(&sargs(&r.join("big.txt"), "a", json!({}))).unwrap_err();
+        assert_eq!(e.kind, "file_too_large");
+        // files over 1 MiB are skipped during a walk
+        let v = run_search(&sargs(r, "aaaa", json!({}))).unwrap();
+        assert_eq!(v["count"], 0);
+    }
+
+    #[test]
+    fn engine_version_matches_lock() {
+        let lock = include_str!("../../Cargo.lock");
+        let (name, version) = ENGINE_VERSION.split_once(' ').unwrap();
+        assert!(
+            lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"")),
+            "update ENGINE_VERSION"
+        );
     }
 }

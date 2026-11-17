@@ -1,7 +1,7 @@
 name: release
-# Tag `vX.Y.Z` (matching the crate version) → build windows-sosa-mcp.exe, bundle it with the
-# pinned ripgrep used by windows_search_text, attach the zip, the bare exe and SHA256SUMS to a
-# GitHub Release. Pre-release tags (`v0.2.0-rc.1`) make a pre-release.
+# Tag `vX.Y.Z` (matching the crate version) → build the self-contained windows-sosa-mcp.exe and
+# attach it with SHA256SUMS to a GitHub Release. Pre-release tags (`v0.2.0-rc.1`) make a
+# pre-release.
 on:
   push:
     tags: ["v*"]
@@ -35,31 +35,21 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $name = "windows-sosa-mcp-$env:TARGET"
-          $stage = "dist\$name"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target\$env:TARGET\release\windows-sosa-mcp.exe" $stage
-          ./scripts/fetch-rg.ps1 -Dest "$stage\vendor"
-          Copy-Item README.md, CHANGELOG.md, LICENSE-MIT, LICENSE-APACHE $stage
-          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$name.zip"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target\$env:TARGET\release\windows-sosa-mcp.exe" dist\windows-sosa-mcp.exe
-          Remove-Item -Recurse -Force $stage
           Get-ChildItem dist
-      - name: Smoke test the packaged server
+      - name: Smoke test the release exe
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $dir = Join-Path $env:RUNNER_TEMP 'sosa-smoke'
-          Expand-Archive "dist\windows-sosa-mcp-$env:TARGET.zip" -DestinationPath $dir
           $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"release-smoke","version":"0"}}}'
           $note = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
           $list = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-          $out = ($init, $note, $list) -join "`n" | & "$dir\windows-sosa-mcp.exe"
+          $out = ($init, $note, $list) -join "`n" | & dist\windows-sosa-mcp.exe
           $resp = $out | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.id -eq 2 }
           $n = @($resp.result.tools).Count
           if ($n -ne 24) { throw "expected 24 tools, got $n" }
-          if (-not (Test-Path "$dir\vendor\rg.exe")) { throw 'vendor\rg.exe missing from the zip' }
-          "ok: $n tools, vendor/rg.exe present"
+          "ok: $n tools"
       - uses: actions/upload-artifact@v4
         with:
           name: windows-sosa-mcp-release
@@ -80,7 +70,7 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          sha256sum windows-sosa-mcp-*.zip windows-sosa-mcp.exe > SHA256SUMS
+          sha256sum windows-sosa-mcp.exe > SHA256SUMS
           cat SHA256SUMS
       - name: Release notes from CHANGELOG.md
         env:

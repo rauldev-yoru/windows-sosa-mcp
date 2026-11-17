@@ -8,6 +8,9 @@ repository = "https://github.com/rauldev-yoru/windows-sosa-mcp"
 
 [dependencies]
 base64 = "0.22"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.34"
 image = { version = "0.25", default-features = false, features = ["png"] }
 regex = { version = "1.13", default-features = false, features = ["std", "unicode", "perf"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
