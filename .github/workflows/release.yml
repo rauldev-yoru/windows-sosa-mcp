@@ -146,4 +146,4 @@ jobs:
             echo "::notice::npm publish skipped: set the NPM_TOKEN secret or the NPM_TRUSTED_PUBLISHING variable (docs/release.md)"
             exit 0
           fi
-          npm publish dist/windows-sosa-mcp-*.tgz --provenance --access public --tag "$dist_tag"
+          npm publish ./dist/windows-sosa-mcp-*.tgz --provenance --access public --tag "$dist_tag"
