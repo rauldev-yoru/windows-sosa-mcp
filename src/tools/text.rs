@@ -1635,7 +1635,8 @@ mod tests {
 
     #[test]
     fn engine_version_matches_lock() {
-        let lock = include_str!("../../Cargo.lock");
+        // Windows checkouts may convert the lockfile to CRLF.
+        let lock = include_str!("../../Cargo.lock").replace("\r\n", "\n");
         let (name, version) = ENGINE_VERSION.split_once(' ').unwrap();
         assert!(
             lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"")),
