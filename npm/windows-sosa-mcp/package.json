@@ -1,0 +1,44 @@
+{
+  "name": "windows-sosa-mcp",
+  "version": "0.1.0",
+  "description": "Native Windows MCP server over stdio: shell, files, jobs, WinGet, UI Automation, screen capture and guarded hands-free input",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "windows",
+    "ui-automation",
+    "powershell",
+    "winget",
+    "screenshot"
+  ],
+  "homepage": "https://github.com/rauldev-yoru/windows-sosa-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/rauldev-yoru/windows-sosa-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rauldev-yoru/windows-sosa-mcp.git",
+    "directory": "npm/windows-sosa-mcp"
+  },
+  "license": "MIT OR Apache-2.0",
+  "bin": {
+    "windows-sosa-mcp": "bin/windows-sosa-mcp.js"
+  },
+  "files": [
+    "bin/windows-sosa-mcp.js",
+    "bin/windows-sosa-mcp.exe",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,7 +1,8 @@
 name: release
-# Tag `vX.Y.Z` (matching the crate version) → build the self-contained windows-sosa-mcp.exe and
-# attach it with SHA256SUMS to a GitHub Release. Pre-release tags (`v0.2.0-rc.1`) make a
-# pre-release.
+# Tag `vX.Y.Z` (matching the crate version) → build the self-contained windows-sosa-mcp.exe,
+# attach it with SHA256SUMS to a GitHub Release, then pack, smoke-test and (when configured)
+# publish the npm package. Pre-release tags (`v0.2.0-rc.1`) make a GitHub pre-release and an
+# npm `next` dist-tag. See docs/release.md.
 on:
   push:
     tags: ["v*"]
@@ -99,3 +100,50 @@ jobs:
             --notes-file notes.md \
             --verify-tag \
             "${pre[@]}"
+
+  npm:
+    needs: [build, release]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance / trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-sosa-mcp-release
+          path: dist
+      - name: Stage, pack and smoke-test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node npm/stage.mjs dist/windows-sosa-mcp.exe
+          if ($LASTEXITCODE -ne 0) { throw 'stage failed' }
+          npm pack ./npm/windows-sosa-mcp --pack-destination dist
+          if ($LASTEXITCODE -ne 0) { throw 'npm pack failed' }
+          $tgz = (Get-ChildItem dist/windows-sosa-mcp-*.tgz).FullName
+          node npm/smoke.mjs $tgz
+          if ($LASTEXITCODE -ne 0) { throw 'npm smoke test failed' }
+      - name: Publish to npm
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TRUSTED_PUBLISHING: ${{ vars.NPM_TRUSTED_PUBLISHING }}
+        run: |
+          dist_tag=latest
+          if [[ "$TAG" == *-* ]]; then dist_tag=next; fi
+          if [ -n "$NPM_TOKEN" ]; then
+            export NODE_AUTH_TOKEN="$NPM_TOKEN"
+          elif [ "$TRUSTED_PUBLISHING" = "true" ]; then
+            # Trusted publishing exchanges the OIDC token itself (npm >= 11.5.1).
+            npm install -g npm@latest
+          else
+            echo "::notice::npm publish skipped: set the NPM_TOKEN secret or the NPM_TRUSTED_PUBLISHING variable (docs/release.md)"
+            exit 0
+          fi
+          npm publish dist/windows-sosa-mcp-*.tgz --provenance --access public --tag "$dist_tag"

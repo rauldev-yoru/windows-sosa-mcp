@@ -1,3 +1,6 @@
 target/
 *.pdb
 __pycache__/
+/npm/windows-sosa-mcp/bin/*.exe
+/npm/windows-sosa-mcp/LICENSE-*
+*.tgz
