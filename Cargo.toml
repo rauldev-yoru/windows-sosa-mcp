@@ -1,0 +1,54 @@
+[package]
+name = "windows-sosa-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Native Windows stdio MCP server (shell, files, jobs, packages, UI Automation, capture, hands-free input)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rauldev-yoru/windows-sosa-mcp"
+
+[dependencies]
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+regex = { version = "1.13", default-features = false, features = ["std", "unicode", "perf"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+jsonschema = { version = "0.61", default-features = false }
+rmcp = { version = "3.10.0", features = ["server", "transport-io"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+similar = "2"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std"] }
+uuid = { version = "1.29.2", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authentication_Identity", "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+# UI Automation (COM), window enumeration and GDI capture.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_Xps",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+sha2 = "0.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

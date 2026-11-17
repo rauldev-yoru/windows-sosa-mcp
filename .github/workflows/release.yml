@@ -1,0 +1,111 @@
+name: release
+# Tag `vX.Y.Z` (matching the crate version) → build windows-sosa-mcp.exe, bundle it with the
+# pinned ripgrep used by windows_search_text, attach the zip, the bare exe and SHA256SUMS to a
+# GitHub Release. Pre-release tags (`v0.2.0-rc.1`) make a pre-release.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+env:
+  TARGET: x86_64-pc-windows-msvc
+  CARGO_TERM_COLOR: always
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - name: Tag matches the crate version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "windows-sosa-mcp") | .version')
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match windows-sosa-mcp $version"
+            exit 1
+          fi
+      - run: cargo test --all-targets --locked
+      - run: cargo build --release --locked --target ${{ env.TARGET }}
+      - name: Stage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "windows-sosa-mcp-$env:TARGET"
+          $stage = "dist\$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target\$env:TARGET\release\windows-sosa-mcp.exe" $stage
+          ./scripts/fetch-rg.ps1 -Dest "$stage\vendor"
+          Copy-Item README.md, CHANGELOG.md, LICENSE-MIT, LICENSE-APACHE $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$name.zip"
+          Copy-Item "target\$env:TARGET\release\windows-sosa-mcp.exe" dist\windows-sosa-mcp.exe
+          Remove-Item -Recurse -Force $stage
+          Get-ChildItem dist
+      - name: Smoke test the packaged server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'sosa-smoke'
+          Expand-Archive "dist\windows-sosa-mcp-$env:TARGET.zip" -DestinationPath $dir
+          $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"release-smoke","version":"0"}}}'
+          $note = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+          $list = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+          $out = ($init, $note, $list) -join "`n" | & "$dir\windows-sosa-mcp.exe"
+          $resp = $out | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.id -eq 2 }
+          $n = @($resp.result.tools).Count
+          if ($n -ne 24) { throw "expected 24 tools, got $n" }
+          if (-not (Test-Path "$dir\vendor\rg.exe")) { throw 'vendor\rg.exe missing from the zip' }
+          "ok: $n tools, vendor/rg.exe present"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-sosa-mcp-release
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-sosa-mcp-release
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum windows-sosa-mcp-*.zip windows-sosa-mcp.exe > SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          awk -v v="$version" '
+            /^## \[/ { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          pre=()
+          if [[ "$TAG" == *-* ]]; then pre=(--prerelease); fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "windows-sosa-mcp $TAG" \
+            --notes-file notes.md \
+            --verify-tag \
+            "${pre[@]}"
