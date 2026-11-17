@@ -6,6 +6,39 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-16
+
+Installation and packaging release; the tool contract is unchanged.
+
+### Changed
+
+- `windows_search_text` runs ripgrep's library crates (`grep-searcher`,
+  `grep-regex`, `ignore`) inside the server instead of a pinned `rg.exe`.
+  Same options, matches, limits and error kinds; it stops reading as soon
+  as a result, byte or time budget is hit. No process start: about 2×
+  faster on full scans, 10–50× when a limit ends the search early. `engine_version` now reports the embedded crate
+  (`grep-searcher 0.1.17`).
+- Releases ship the self-contained `windows-sosa-mcp.exe` plus
+  `SHA256SUMS`; the zip is gone.
+
+### Added
+
+- npm package `windows-sosa-mcp` (Windows x64): `npx -y windows-sosa-mcp`
+  runs the bundled exe through a small launcher that keeps stdout for
+  JSON-RPC and forwards the exit code. The release workflow packs and
+  smoke-tests it, and publishes when an npm token or trusted publishing is
+  configured (`docs/release.md`).
+- One-line installer `install.ps1`
+  (`irm https://raw.githubusercontent.com/rauldev-yoru/windows-sosa-mcp/main/install.ps1 | iex`):
+  checksum-verified install to `%LOCALAPPDATA%\Programs\windows-sosa-mcp`,
+  user `PATH`, in-place upgrades while the old exe is running, `-Uninstall`.
+
+### Removed
+
+- `vendor\rg.exe`, `scripts/fetch-rg.ps1` and the `WINDOWS_SOSA_MCP_VENDOR`
+  variable; `windows_search_text` no longer returns `dependency_missing`
+  or `dependency_changed`.
+
 ## [0.1.0] - 2026-11-16
 
 First release.
@@ -39,5 +72,6 @@ First release.
 - Release workflow: zip with the exe and pinned ripgrep, standalone exe and
   `SHA256SUMS`.
 
-[Unreleased]: https://github.com/rauldev-yoru/windows-sosa-mcp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rauldev-yoru/windows-sosa-mcp/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/rauldev-yoru/windows-sosa-mcp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rauldev-yoru/windows-sosa-mcp/releases/tag/v0.1.0

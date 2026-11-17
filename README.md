@@ -48,30 +48,54 @@ for windows, elements, focus or user idleness.
 
 ## Install
 
-### Release download
+Pick one. All three give you the same self-contained `windows-sosa-mcp.exe`
+(Windows x64, ~10 MB, no runtime or helper binaries).
 
-Each [GitHub release](https://github.com/rauldev-yoru/windows-sosa-mcp/releases)
-has:
+### 1. npx (Node.js 18+)
 
-| Asset | Content |
-|---|---|
-| `windows-sosa-mcp-x86_64-pc-windows-msvc.zip` | `windows-sosa-mcp.exe`, `vendor\rg.exe` + `vendor\rg.sha256` (pinned ripgrep for `windows_search_text`, with its license), README, CHANGELOG, licenses |
-| `windows-sosa-mcp.exe` | the server alone (every tool except `windows_search_text`) |
-| `SHA256SUMS` | SHA-256 of both assets |
+Nothing to install up front: point your MCP client at
 
-Prefer the zip. Verify and unpack in PowerShell:
-
-```powershell
-$v = 'v0.1.0'
-$base = "https://github.com/rauldev-yoru/windows-sosa-mcp/releases/download/$v"
-Invoke-WebRequest "$base/windows-sosa-mcp-x86_64-pc-windows-msvc.zip" -OutFile sosa.zip
-Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
-(Get-FileHash sosa.zip -Algorithm SHA256).Hash.ToLower()
-Select-String 'windows-sosa-mcp-x86_64-pc-windows-msvc.zip' SHA256SUMS   # must match
-Expand-Archive sosa.zip -DestinationPath "$env:LOCALAPPDATA\Programs\windows-sosa-mcp"
+```sh
+npx -y windows-sosa-mcp
 ```
 
-Keep `vendor\` next to the exe (or point `WINDOWS_SOSA_MCP_VENDOR` at it).
+npm downloads the package once (~4 MB) and runs the bundled exe through a
+tiny launcher. Each start goes through `npx`, so it takes about a second
+longer than starting the exe directly.
+
+### 2. One-line installer (PowerShell, no admin)
+
+```powershell
+irm https://raw.githubusercontent.com/rauldev-yoru/windows-sosa-mcp/main/install.ps1 | iex
+```
+
+It downloads the latest release, verifies it against `SHA256SUMS`, installs
+it to `%LOCALAPPDATA%\Programs\windows-sosa-mcp\windows-sosa-mcp.exe`, adds
+that folder to your user `PATH` and prints a config snippet. Run it again to
+upgrade (works while clients still run the old exe). Options, as
+environment variables: `WINDOWS_SOSA_MCP_VERSION` (`v0.1.1`, default latest),
+`WINDOWS_SOSA_MCP_INSTALL_DIR`, `WINDOWS_SOSA_MCP_NO_MODIFY_PATH=1`.
+Uninstall:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/rauldev-yoru/windows-sosa-mcp/main/install.ps1))) -Uninstall
+```
+
+### 3. Manual download
+
+Each [GitHub release](https://github.com/rauldev-yoru/windows-sosa-mcp/releases)
+has `windows-sosa-mcp.exe` and `SHA256SUMS`:
+
+```powershell
+$v = 'v0.1.1'
+$base = "https://github.com/rauldev-yoru/windows-sosa-mcp/releases/download/$v"
+$dir = "$env:LOCALAPPDATA\Programs\windows-sosa-mcp"
+New-Item -ItemType Directory -Force $dir | Out-Null
+Invoke-WebRequest "$base/windows-sosa-mcp.exe" -OutFile "$dir\windows-sosa-mcp.exe"
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile "$dir\SHA256SUMS"
+(Get-FileHash "$dir\windows-sosa-mcp.exe" -Algorithm SHA256).Hash.ToLower()
+Get-Content "$dir\SHA256SUMS"   # must list the same hash
+```
 
 ### Build from source
 
@@ -80,8 +104,7 @@ Needs a Rust toolchain (stable, MSVC target) on Windows:
 ```powershell
 git clone https://github.com/rauldev-yoru/windows-sosa-mcp
 cd windows-sosa-mcp
-cargo build --release --locked                     # target\release\windows-sosa-mcp.exe
-.\scripts\fetch-rg.ps1 -Dest target\release\vendor  # pinned ripgrep for windows_search_text
+cargo build --release --locked   # target\release\windows-sosa-mcp.exe
 ```
 
 The crate also builds and tests on Linux; Windows-only tools then answer
@@ -89,8 +112,9 @@ The crate also builds and tests on Linux; Windows-only tools then answer
 
 ## Configure an MCP client
 
-The server speaks MCP over stdio and takes no arguments. Use the full path
-of the exe in every example below.
+The server speaks MCP over stdio and takes no arguments. The examples use
+`npx`; with the installer, use `windows-sosa-mcp` (or the full exe path
+it printed) as the command and drop the args.
 
 **Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`):
 
@@ -98,11 +122,15 @@ of the exe in every example below.
 {
   "mcpServers": {
     "windows-sosa": {
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\windows-sosa-mcp\\windows-sosa-mcp.exe"
+      "command": "npx",
+      "args": ["-y", "windows-sosa-mcp"]
     }
   }
 }
 ```
+
+Installed exe instead: `"command": "windows-sosa-mcp"` (or
+`"C:\\Users\\<you>\\AppData\\Local\\Programs\\windows-sosa-mcp\\windows-sosa-mcp.exe"`).
 
 **VS Code** (`.vscode/mcp.json` or the user `mcp.json`):
 
@@ -111,7 +139,8 @@ of the exe in every example below.
   "servers": {
     "windows-sosa": {
       "type": "stdio",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\windows-sosa-mcp\\windows-sosa-mcp.exe"
+      "command": "npx",
+      "args": ["-y", "windows-sosa-mcp"]
     }
   }
 }
@@ -124,11 +153,19 @@ of the exe in every example below.
   "mcp": {
     "windows-sosa": {
       "type": "local",
-      "command": ["C:\\Users\\<you>\\AppData\\Local\\Programs\\windows-sosa-mcp\\windows-sosa-mcp.exe"],
+      "command": ["npx", "-y", "windows-sosa-mcp"],
       "enabled": true
     }
   }
 }
+```
+
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.windows-sosa]
+command = "npx"
+args = ["-y", "windows-sosa-mcp"]
 ```
 
 **Hermes Agent and other generic stdio clients** (YAML):
@@ -136,9 +173,13 @@ of the exe in every example below.
 ```yaml
 mcp_servers:
   windows-sosa:
-    command: C:\Users\<you>\AppData\Local\Programs\windows-sosa-mcp\windows-sosa-mcp.exe
+    command: windows-sosa-mcp
     args: []
 ```
+
+If a client can't start `npx` on Windows (it is a `.cmd` shim), use
+`"command": "cmd", "args": ["/c", "npx", "-y", "windows-sosa-mcp"]` or the
+installed exe.
 
 Clients should issue one tool call at a time: a call made while another is
 running gets a `busy` result immediately.
@@ -151,7 +192,8 @@ endpoint:
 
 ```sh
 # on the Windows machine (the enishi daemon must run as the desktop user)
-enishi service add sosa --mcp -- windows-sosa-mcp.exe
+enishi service add sosa --mcp -- npx -y windows-sosa-mcp
+# or, with the installed exe: enishi service add sosa --mcp -- windows-sosa-mcp
 
 # on the client machine: use this as the MCP server command
 enishi mcp <device>/sosa
@@ -212,7 +254,6 @@ the caller.
 |---|---|
 | `WINDOWS_SOSA_MCP_HOME` | state root (default `%LOCALAPPDATA%\windows-sosa-mcp`) |
 | `WINDOWS_SOSA_MCP_UI_POLICY` | UI policy file |
-| `WINDOWS_SOSA_MCP_VENDOR` | directory with `rg.exe` + `rg.sha256` (default `<exe dir>\vendor`) |
 | `WINDOWS_SOSA_MCP_POWERSHELL` | PowerShell executable (default Windows PowerShell 5.1) |
 | `WINDOWS_SOSA_MCP_WINGET` | WinGet executable |
 | `WINDOWS_SOSA_MCP_HANDSFREE_DRYRUN` | `1` = hands-free without hooks/overlay/real input — **tests only** |
@@ -244,7 +285,8 @@ Design, safety model, envelope, error kinds and decisions:
 
 ## Status
 
-v0.1.0 — first release. All 24 tools are implemented natively and
+v0.1.1 — single self-contained exe; npm and one-line installer
+distribution. All 24 tools are implemented natively and
 validated on Windows 11 with multiple monitors, including real input
 blocking, overlay, release hotkey, fail-open and TTL. The tool contract
 may still change before 1.0; breaking changes are listed in the changelog.
@@ -252,5 +294,6 @@ may still change before 1.0; breaking changes are listed in the changelog.
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE-APACHE), at your option. The release zip bundles
-[ripgrep](https://github.com/BurntSushi/ripgrep) (MIT / Unlicense).
+[Apache-2.0](LICENSE-APACHE), at your option. `windows_search_text` is
+built on [ripgrep](https://github.com/BurntSushi/ripgrep)'s library crates
+(MIT / Unlicense).
